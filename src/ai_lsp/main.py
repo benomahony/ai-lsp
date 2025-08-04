@@ -45,6 +45,10 @@ def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
     return logger
 
 
+# TODO: Add support for other LLM providers
+# TODO: Add support for other LLM models
+# TODO: Add support for other LLM prompts
+# TODO: Add support for onepassword
 class Settings(BaseSettings):
     gemini_api_key: str = Field(default="")
 
@@ -80,6 +84,7 @@ gemini_model = GeminiModel(
 )
 
 
+# TODO: Add support for auto fixes i.e. code actions
 class CodeIssue(BaseModel):
     line: int
     column: int
@@ -239,25 +244,8 @@ async def did_save(params: DidSaveTextDocumentParams):
 async def did_change(params: DidChangeTextDocumentParams):
     """Optionally analyze on change (debounced)"""
     server.logger.debug(f"Document changed: {params.text_document.uri}")
-    # Could add debouncing here to avoid too frequent analysis
+    # TODO: Could add debouncing here to avoid too frequent analysis
     pass
-
-
-@app.command()
-def test(log_level: str = "DEBUG"):
-    """Test the AI LSP server with TCP mode for debugging"""
-    logger = setup_logging(log_level)
-    logger.info("Starting AI LSP server in test mode (TCP on localhost:8765)")
-    print("🧠 AI LSP Server starting in test mode...")
-    print("📝 Logs written to ~/.ai-lsp.log")
-    print("🔗 Connect your LSP client to tcp://localhost:8765")
-    print("⏹️  Press Ctrl+C to stop")
-
-    try:
-        server.start_tcp("127.0.0.1", 8765)
-    except KeyboardInterrupt:
-        logger.info("Server stopped by user")
-        print("\n👋 AI LSP Server stopped")
 
 
 @app.command()
