@@ -1,14 +1,16 @@
-#!/usr/bin/env python3
-
 import logging
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import typer
 from lsprotocol.types import (
+    TEXT_DOCUMENT_CODE_ACTION,
     TEXT_DOCUMENT_DID_CHANGE,
     TEXT_DOCUMENT_DID_OPEN,
     TEXT_DOCUMENT_DID_SAVE,
+    CodeAction,
+    CodeActionKind,
+    CodeActionParams,
     Diagnostic,
     DiagnosticSeverity,
     DidChangeTextDocumentParams,
@@ -16,11 +18,13 @@ from lsprotocol.types import (
     DidSaveTextDocumentParams,
     Position,
     Range,
+    TextEdit,
+    WorkspaceEdit,
 )
 from pydantic import BaseModel, Field, field_validator
 from pydantic_ai import Agent
-from pydantic_ai.providers.google_gla import GoogleGLAProvider
 from pydantic_ai.models.gemini import GeminiModel
+from pydantic_ai.providers.google_gla import GoogleGLAProvider
 from pydantic_settings import BaseSettings
 from pygls.server import LanguageServer
 
@@ -30,7 +34,7 @@ app = typer.Typer()
 def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
     """Setup logging for the LSP server. Must log to file since stdio is used for LSP communication."""
     if log_file is None:
-        log_file = Path.home() / ".ai-lsp.log"
+        log_file = Path("ai-lsp.log")
 
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
@@ -84,7 +88,15 @@ gemini_model = GeminiModel(
 )
 
 
-# TODO: Add support for auto fixes i.e. code actions
+class SuggestedFix(BaseModel):
+    code: str
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+    title: str
+
+
 class CodeIssue(BaseModel):
     line: int
     column: int
@@ -93,6 +105,7 @@ class CodeIssue(BaseModel):
     severity: str  # "error", "warning", "info", "hint"
     message: str
     code: str | None = None
+    suggested_fixes: list[SuggestedFix] | None = None
 
 
 class DiagnosticResult(BaseModel):
@@ -104,6 +117,7 @@ class AILanguageServer(LanguageServer):
         super().__init__("ai-lsp", "v0.1.0")
         self.logger = logging.getLogger("ai-lsp.server")
         self.logger.info("Initializing AI Language Server")
+        self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
 
         self.agent = Agent(
             model=gemini_model,
@@ -133,6 +147,7 @@ For each issue, provide:
 - Clear explanation of WHY this needs human attention
 - Suggested architectural or design improvements
 - Use severity: "info" for suggestions, "warning" for concerns, "error" for serious logic issues
+- When possible, provide suggested_fixes with exact replacement code and a clear title
 
 Focus on insights that require understanding code intent and context.""",
         )
@@ -159,6 +174,9 @@ File: {file_path.name}"""
             self.logger.info(
                 f"AI analysis completed, found {len(result.output.issues)} issues"
             )
+
+            # Cache the issues for code actions
+            self._diagnostic_cache[uri] = result.output.issues
 
             diagnostics = []
             for issue in result.output.issues:
@@ -246,6 +264,68 @@ async def did_change(params: DidChangeTextDocumentParams):
     server.logger.debug(f"Document changed: {params.text_document.uri}")
     # TODO: Could add debouncing here to avoid too frequent analysis
     pass
+
+
+@server.feature(TEXT_DOCUMENT_CODE_ACTION)
+async def code_action(params: CodeActionParams) -> list[CodeAction]:
+    """Provide code actions for AI LSP diagnostics"""
+    server.logger.info(f"Code action requested for {params.text_document.uri}")
+
+    actions = []
+    uri = params.text_document.uri
+
+    # Get cached issues for this document
+    cached_issues = server._diagnostic_cache.get(uri, [])
+
+    # Find issues that overlap with the requested range
+    for issue in cached_issues:
+        if not issue.suggested_fixes:
+            continue
+
+        issue_range = Range(
+            start=Position(line=issue.line, character=issue.column),
+            end=Position(line=issue.end_line, character=issue.end_column),
+        )
+
+        # Check if the issue range overlaps with the requested range
+        if _ranges_overlap(issue_range, params.range):
+            for fix in issue.suggested_fixes:
+                fix_range = Range(
+                    start=Position(line=fix.line, character=fix.column),
+                    end=Position(line=fix.end_line, character=fix.end_column),
+                )
+
+                edit = WorkspaceEdit(
+                    changes={
+                        uri: [
+                            TextEdit(
+                                range=fix_range,
+                                new_text=fix.code,
+                            )
+                        ]
+                    }
+                )
+
+                action = CodeAction(
+                    title=fix.title,
+                    kind=CodeActionKind.QuickFix,
+                    edit=edit,
+                    is_preferred=True,
+                )
+                actions.append(action)
+
+    server.logger.info(f"Generated {len(actions)} code actions for {uri}")
+    return actions
+
+
+def _ranges_overlap(range1: Range, range2: Range) -> bool:
+    """Check if two ranges overlap"""
+    start1 = (range1.start.line, range1.start.character)
+    end1 = (range1.end.line, range1.end.character)
+    start2 = (range2.start.line, range2.start.character)
+    end2 = (range2.end.line, range2.end.character)
+
+    return start1 <= end2 and start2 <= end1
 
 
 @app.command()
