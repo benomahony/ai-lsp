@@ -1,7 +1,7 @@
 import logging
-import subprocess
 from pathlib import Path
 
+from pydantic_ai.models import KnownModelName
 import typer
 from lsprotocol.types import (
     TEXT_DOCUMENT_CODE_ACTION,
@@ -21,10 +21,8 @@ from lsprotocol.types import (
     TextEdit,
     WorkspaceEdit,
 )
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.models.gemini import GeminiModel
-from pydantic_ai.providers.google_gla import GoogleGLAProvider
 from pydantic_settings import BaseSettings
 from pygls.server import LanguageServer
 
@@ -49,43 +47,12 @@ def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
     return logger
 
 
-# TODO: Add support for other LLM providers
-# TODO: Add support for other LLM models
 # TODO: Add support for other LLM prompts
-# TODO: Add support for onepassword
 class Settings(BaseSettings):
-    gemini_api_key: str = Field(default="")
-
-    @field_validator("gemini_api_key", mode="before")
-    @classmethod
-    def get_api_key(cls, v: str) -> str:
-        if v:
-            return v
-
-        try:
-            result = subprocess.run(
-                args=[
-                    "op",
-                    "read",
-                    "op://employee/povmeksro7vsc5xhdufg7mpp4q/credential",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except Exception:
-            pass
-
-        raise ValueError("GEMINI_API_KEY not found in environment or 1Password")
+    model: KnownModelName = Field(default="google-gla:gemini-2.5-pro")
 
 
 settings = Settings()
-
-gemini_model = GeminiModel(
-    "gemini-2.5-pro-preview-05-06",
-    provider=GoogleGLAProvider(api_key=settings.gemini_api_key),
-)
 
 
 class SuggestedFix(BaseModel):
@@ -120,7 +87,7 @@ class AILanguageServer(LanguageServer):
         self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
 
         self.agent = Agent(
-            model=gemini_model,
+            model=settings.model,
             output_type=DiagnosticResult,
             system_prompt="""You are an AI code analyzer that provides semantic insights that traditional LSPs cannot detect.
 
