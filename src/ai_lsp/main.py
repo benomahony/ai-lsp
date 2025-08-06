@@ -85,10 +85,14 @@ class AILanguageServer(LanguageServer):
         self.logger = logging.getLogger("ai-lsp.server")
         self.logger.info("Initializing AI Language Server")
         self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
+        # TODO: Add smarter caching i.e. pass cache to agent + update incrementally
+        # TODO: Should we habe a cache for each document?
+        # TODO: Should we have a cache for each rule?
 
         self.agent = Agent(
             model=settings.ai_lsp_model,
             output_type=DiagnosticResult,
+            # TODO: Splir out the system prompt into different rules
             system_prompt="""You are an AI code analyzer that provides semantic insights that traditional LSPs cannot detect.
 
 ONLY flag issues that require deep semantic understanding:
@@ -233,6 +237,7 @@ async def did_change(params: DidChangeTextDocumentParams):
     pass
 
 
+# TODO: Handle document changes in a smarter way i.e. pass cache to agent + update incrementally
 @server.feature(TEXT_DOCUMENT_CODE_ACTION)
 async def code_action(params: CodeActionParams) -> list[CodeAction]:
     """Provide code actions for AI LSP diagnostics"""
