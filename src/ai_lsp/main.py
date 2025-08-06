@@ -49,7 +49,7 @@ def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
 
 # TODO: Add support for other LLM prompts
 class Settings(BaseSettings):
-    model: KnownModelName = Field(default="google-gla:gemini-2.5-pro")
+    ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-pro")
 
 
 settings = Settings()
@@ -87,7 +87,7 @@ class AILanguageServer(LanguageServer):
         self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
 
         self.agent = Agent(
-            model=settings.model,
+            model=settings.ai_lsp_model,
             output_type=DiagnosticResult,
             system_prompt="""You are an AI code analyzer that provides semantic insights that traditional LSPs cannot detect.
 
@@ -281,7 +281,6 @@ async def code_action(params: CodeActionParams) -> list[CodeAction]:
                 )
                 actions.append(action)
 
-    server.logger.info(f"Generated {len(actions)} code actions for {uri}")
     return actions
 
 
