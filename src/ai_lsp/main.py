@@ -80,6 +80,7 @@ class AILanguageServer(LanguageServer):
         self.logger.info("Initializing AI Language Server")
         self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
         self._pending_tasks: dict[str, asyncio.Task] = {}
+        self._analysis_locks: dict[str, asyncio.Lock] = {}
 
         self.agent = Agent(
             model=settings.ai_lsp_model,
@@ -105,15 +106,15 @@ DO NOT flag issues that normal LSPs handle:
 - Simple linting rules
 
 For each issue, provide:
-- The exact code_snippet that has the problem (just the minimal problematic part, e.g. "kdap" not entire functions)
+- The exact issue_snippet that has the problem (ONLY the problematic token/value, e.g. just "python" not 'command = "python"')
 - Clear explanation of WHY this needs human attention in the message
 - Use severity: "info" for suggestions, "warning" for concerns, "error" for serious logic issues
 - When possible, provide suggested_fixes with:
-  - target_snippet: the exact code to replace (same as code_snippet usually)
-  - code: the replacement code
+  - target_snippet: the exact code to replace (same as issue_snippet usually)
+  - replacement_snippet: the replacement code
   - title: clear description of the fix
 
-Focus on insights that require understanding code intent and context. Keep code_snippet minimal.""",
+Focus on insights that require understanding code intent and context. Keep issue_snippet to the absolute minimum - just the problematic token.""",
         )
         self.logger.info("AI agent initialized successfully")
 
@@ -121,16 +122,40 @@ Focus on insights that require understanding code intent and context. Keep code_
         self, text: str, snippet: str
     ) -> list[tuple[int, int, int, int]]:
         """Find code snippet in text, return positions as (start_line, start_col, end_line, end_col)"""
-        lines = text.split("\n")
         snippet = snippet.strip()
 
-        # Look for the snippet as a substring in any line
+        # Search entire document for snippet (handles multi-line)
+        start_pos = text.find(snippet)
+        if start_pos == -1:
+            self.logger.warning(f"Could not find snippet '{snippet}' in text")
+            return []
+
+        # Convert character position to line/column
+        lines = text.split("\n")
+        char_count = 0
+        start_line = 0
+        start_col = 0
+
         for i, line in enumerate(lines):
-            if snippet in line:
-                start_col = line.find(snippet)
-                end_col = start_col + len(snippet)
-                return [(i, start_col, i, end_col)]
-        return []
+            if char_count + len(line) >= start_pos:
+                start_line = i
+                start_col = start_pos - char_count
+                break
+            char_count += len(line) + 1  # +1 for newline
+
+        # Calculate end position
+        snippet_lines = snippet.split("\n")
+        if len(snippet_lines) == 1:
+            end_line = start_line
+            end_col = start_col + len(snippet)
+        else:
+            end_line = start_line + len(snippet_lines) - 1
+            end_col = len(snippet_lines[-1])
+
+        self.logger.debug(
+            f"Found '{snippet[:20]}...' at line {start_line}, cols {start_col}-{end_col}"
+        )
+        return [(start_line, start_col, end_line, end_col)]
 
     async def _debounced_analyze(self, uri: str, text: str):
         """Debounced analysis that cancels previous calls"""
@@ -159,39 +184,18 @@ Focus on insights that require understanding code intent and context. Keep code_
         self.logger.debug(f"Published {len(diagnostics)} diagnostics for {uri}")
 
     async def analyze_document(self, uri: str, text: str) -> list[Diagnostic]:
-        self.logger.info(f"Starting AI analysis for {uri}")
+        """Analyze document with race condition protection"""
+        # Ensure we have a lock for this URI
+        lock = self._analysis_locks.setdefault(uri, asyncio.Lock())
+        async with lock:
+            self.logger.info(f"Starting AI analysis for {uri}")
 
-        # First, re-search existing issues
-        diagnostics = []
-        cached_issues = self._diagnostic_cache.get(uri, [])
+            # Always run fresh AI analysis - removed buggy caching logic
+            try:
+                file_path = Path(uri.replace("file://", ""))
+                language = self._detect_language(file_path)
 
-        for issue in cached_issues:
-            positions = self._find_snippet_in_text(text, issue.code_snippet)
-            if positions:
-                start_line, start_col, end_line, end_col = positions[0]
-                diagnostic = Diagnostic(
-                    range=Range(
-                        start=Position(line=start_line, character=start_col),
-                        end=Position(line=end_line, character=end_col),
-                    ),
-                    message=f"AI LSP: {issue.message}",
-                    severity=self._get_diagnostic_severity(issue.severity),
-                    source="ai-lsp",
-                    code=issue.code,
-                )
-                diagnostics.append(diagnostic)
-
-        # If we found all existing issues, return them
-        if len(diagnostics) == len(cached_issues) and cached_issues:
-            self.logger.info(f"Re-used {len(diagnostics)} existing issues for {uri}")
-            return diagnostics
-
-        # Otherwise run AI analysis
-        try:
-            file_path = Path(uri.replace("file://", ""))
-            language = self._detect_language(file_path)
-
-            prompt = f"""Analyze this {language} code for issues:
+                prompt = f"""Analyze this {language} code for issues:
 
 ```{language}
 {text}
@@ -199,37 +203,38 @@ Focus on insights that require understanding code intent and context. Keep code_
 
 File: {file_path.name}"""
 
-            result = await self.agent.run(prompt)
-            self.logger.info(
-                f"AI analysis completed, found {len(result.output.issues)} issues"
-            )
+                result = await self.agent.run(prompt)
+                self.logger.info(
+                    f"AI analysis completed, found {len(result.output.issues)} issues"
+                )
 
-            # Cache the issues
-            self._diagnostic_cache[uri] = result.output.issues
+                # Cache the issues
+                self._diagnostic_cache[uri] = result.output.issues
 
-            diagnostics = []
-            for issue in result.output.issues:
-                positions = self._find_snippet_in_text(text, issue.code_snippet)
+                diagnostics = []
+                for issue in result.output.issues:
+                    positions = self._find_snippet_in_text(text, issue.issue_snippet)
 
-                if positions:
-                    start_line, start_col, end_line, end_col = positions[0]
-                    diagnostic = Diagnostic(
-                        range=Range(
-                            start=Position(line=start_line, character=start_col),
-                            end=Position(line=end_line, character=end_col),
-                        ),
-                        message=f"AI LSP: {issue.message}",
-                        severity=self._get_diagnostic_severity(issue.severity),
-                        source="ai-lsp",
-                        code=issue.code,
-                    )
-                    diagnostics.append(diagnostic)
+                    if positions:
+                        start_line, start_col, end_line, end_col = positions[0]
+                        diagnostic = Diagnostic(
+                            range=Range(
+                                start=Position(line=start_line, character=start_col),
+                                end=Position(line=end_line, character=end_col),
+                            ),
+                            message=f"AI LSP: {issue.message}",
+                            severity=self._get_diagnostic_severity(issue.severity),
+                            source="ai-lsp",
+                        )
+                        diagnostics.append(diagnostic)
 
-            return diagnostics
+                return diagnostics
 
-        except Exception as e:
-            self.logger.error(f"AI analysis failed for {uri}: {str(e)}", exc_info=True)
-            return []
+            except Exception as e:
+                self.logger.error(
+                    f"AI analysis failed for {uri}: {str(e)}", exc_info=True
+                )
+                return []
 
     def _get_diagnostic_severity(self, severity: str) -> DiagnosticSeverity:
         severity_map = {
@@ -314,7 +319,11 @@ async def code_action(params: CodeActionParams) -> list[CodeAction]:
                 )
 
                 edit = WorkspaceEdit(
-                    changes={uri: [TextEdit(range=fix_range, new_text=fix.code)]}
+                    changes={
+                        uri: [
+                            TextEdit(range=fix_range, new_text=fix.replacement_snippet)
+                        ]
+                    }
                 )
 
                 action = CodeAction(
