@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 
@@ -47,31 +48,24 @@ def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
     return logger
 
 
-# TODO: Add support for other LLM prompts
 class Settings(BaseSettings):
     ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-pro")
+    debounce_ms: int = Field(default=1000)  # 1 second debounce
 
 
 settings = Settings()
 
 
 class SuggestedFix(BaseModel):
-    code: str
-    line: int
-    column: int
-    end_line: int
-    end_column: int
     title: str
+    target_snippet: str
+    replacement_snippet: str
 
 
 class CodeIssue(BaseModel):
-    line: int
-    column: int
-    end_line: int
-    end_column: int
+    issue_snippet: str
     severity: str  # "error", "warning", "info", "hint"
     message: str
-    code: str | None = None
     suggested_fixes: list[SuggestedFix] | None = None
 
 
@@ -85,14 +79,11 @@ class AILanguageServer(LanguageServer):
         self.logger = logging.getLogger("ai-lsp.server")
         self.logger.info("Initializing AI Language Server")
         self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
-        # TODO: Add smarter caching i.e. pass cache to agent + update incrementally
-        # TODO: Should we habe a cache for each document?
-        # TODO: Should we have a cache for each rule?
+        self._pending_tasks: dict[str, asyncio.Task] = {}
 
         self.agent = Agent(
             model=settings.ai_lsp_model,
             output_type=DiagnosticResult,
-            # TODO: Splir out the system prompt into different rules
             system_prompt="""You are an AI code analyzer that provides semantic insights that traditional LSPs cannot detect.
 
 ONLY flag issues that require deep semantic understanding:
@@ -114,23 +105,91 @@ DO NOT flag issues that normal LSPs handle:
 - Simple linting rules
 
 For each issue, provide:
-- Exact line and column positions (0-based)
-- Clear explanation of WHY this needs human attention
-- Suggested architectural or design improvements
+- The exact code_snippet that has the problem (just the minimal problematic part, e.g. "kdap" not entire functions)
+- Clear explanation of WHY this needs human attention in the message
 - Use severity: "info" for suggestions, "warning" for concerns, "error" for serious logic issues
-- When possible, provide suggested_fixes with exact replacement code and a clear title
+- When possible, provide suggested_fixes with:
+  - target_snippet: the exact code to replace (same as code_snippet usually)
+  - code: the replacement code
+  - title: clear description of the fix
 
-Focus on insights that require understanding code intent and context.""",
+Focus on insights that require understanding code intent and context. Keep code_snippet minimal.""",
         )
         self.logger.info("AI agent initialized successfully")
 
+    def _find_snippet_in_text(
+        self, text: str, snippet: str
+    ) -> list[tuple[int, int, int, int]]:
+        """Find code snippet in text, return positions as (start_line, start_col, end_line, end_col)"""
+        lines = text.split("\n")
+        snippet = snippet.strip()
+
+        # Look for the snippet as a substring in any line
+        for i, line in enumerate(lines):
+            if snippet in line:
+                start_col = line.find(snippet)
+                end_col = start_col + len(snippet)
+                return [(i, start_col, i, end_col)]
+        return []
+
+    async def _debounced_analyze(self, uri: str, text: str):
+        """Debounced analysis that cancels previous calls"""
+        # Cancel any existing task for this URI
+        if uri in self._pending_tasks:
+            self._pending_tasks[uri].cancel()
+
+        # Create new task
+        task = asyncio.create_task(self._delayed_analyze(uri, text))
+        self._pending_tasks[uri] = task
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            self.logger.debug(f"Analysis cancelled for {uri}")
+        finally:
+            # Clean up completed task
+            if uri in self._pending_tasks and self._pending_tasks[uri] == task:
+                del self._pending_tasks[uri]
+
+    async def _delayed_analyze(self, uri: str, text: str):
+        """Wait for debounce period then analyze"""
+        await asyncio.sleep(settings.debounce_ms / 1000.0)
+        diagnostics = await self.analyze_document(uri, text)
+        self.publish_diagnostics(uri, diagnostics)
+        self.logger.debug(f"Published {len(diagnostics)} diagnostics for {uri}")
+
     async def analyze_document(self, uri: str, text: str) -> list[Diagnostic]:
         self.logger.info(f"Starting AI analysis for {uri}")
+
+        # First, re-search existing issues
+        diagnostics = []
+        cached_issues = self._diagnostic_cache.get(uri, [])
+
+        for issue in cached_issues:
+            positions = self._find_snippet_in_text(text, issue.code_snippet)
+            if positions:
+                start_line, start_col, end_line, end_col = positions[0]
+                diagnostic = Diagnostic(
+                    range=Range(
+                        start=Position(line=start_line, character=start_col),
+                        end=Position(line=end_line, character=end_col),
+                    ),
+                    message=f"AI LSP: {issue.message}",
+                    severity=self._get_diagnostic_severity(issue.severity),
+                    source="ai-lsp",
+                    code=issue.code,
+                )
+                diagnostics.append(diagnostic)
+
+        # If we found all existing issues, return them
+        if len(diagnostics) == len(cached_issues) and cached_issues:
+            self.logger.info(f"Re-used {len(diagnostics)} existing issues for {uri}")
+            return diagnostics
+
+        # Otherwise run AI analysis
         try:
             file_path = Path(uri.replace("file://", ""))
             language = self._detect_language(file_path)
-
-            self.logger.debug(f"Detected language: {language} for {file_path.name}")
 
             prompt = f"""Analyze this {language} code for issues:
 
@@ -140,54 +199,46 @@ Focus on insights that require understanding code intent and context.""",
 
 File: {file_path.name}"""
 
-            self.logger.debug("Sending request to AI agent")
             result = await self.agent.run(prompt)
             self.logger.info(
                 f"AI analysis completed, found {len(result.output.issues)} issues"
             )
 
-            # Cache the issues for code actions
+            # Cache the issues
             self._diagnostic_cache[uri] = result.output.issues
 
             diagnostics = []
             for issue in result.output.issues:
-                severity_map = {
-                    "error": DiagnosticSeverity.Error,
-                    "warning": DiagnosticSeverity.Warning,
-                    "info": DiagnosticSeverity.Information,
-                    "hint": DiagnosticSeverity.Hint,
-                }
+                positions = self._find_snippet_in_text(text, issue.code_snippet)
 
-                diagnostic = Diagnostic(
-                    range=Range(
-                        start=Position(line=issue.line, character=issue.column),
-                        end=Position(line=issue.end_line, character=issue.end_column),
-                    ),
-                    message=f"AI LSP: {issue.message}",
-                    severity=severity_map.get(
-                        issue.severity, DiagnosticSeverity.Information
-                    ),
-                    source="ai-lsp",
-                    code=issue.code,
-                )
-                diagnostics.append(diagnostic)
+                if positions:
+                    start_line, start_col, end_line, end_col = positions[0]
+                    diagnostic = Diagnostic(
+                        range=Range(
+                            start=Position(line=start_line, character=start_col),
+                            end=Position(line=end_line, character=end_col),
+                        ),
+                        message=f"AI LSP: {issue.message}",
+                        severity=self._get_diagnostic_severity(issue.severity),
+                        source="ai-lsp",
+                        code=issue.code,
+                    )
+                    diagnostics.append(diagnostic)
 
-            self.logger.info(f"Generated {len(diagnostics)} diagnostics for {uri}")
             return diagnostics
 
         except Exception as e:
             self.logger.error(f"AI analysis failed for {uri}: {str(e)}", exc_info=True)
-            return [
-                Diagnostic(
-                    range=Range(
-                        start=Position(line=0, character=0),
-                        end=Position(line=0, character=0),
-                    ),
-                    message=f"AI LSP unavailable: {str(e)}",
-                    severity=DiagnosticSeverity.Information,
-                    source="ai-lsp",
-                )
-            ]
+            return []
+
+    def _get_diagnostic_severity(self, severity: str) -> DiagnosticSeverity:
+        severity_map = {
+            "error": DiagnosticSeverity.Error,
+            "warning": DiagnosticSeverity.Warning,
+            "info": DiagnosticSeverity.Information,
+            "hint": DiagnosticSeverity.Hint,
+        }
+        return severity_map.get(severity, DiagnosticSeverity.Information)
 
     def _detect_language(self, file_path: Path) -> str:
         suffix_map = {
@@ -231,51 +282,39 @@ async def did_save(params: DidSaveTextDocumentParams):
 
 @server.feature(TEXT_DOCUMENT_DID_CHANGE)
 async def did_change(params: DidChangeTextDocumentParams):
-    """Optionally analyze on change (debounced)"""
+    """Debounced analysis on change"""
     server.logger.debug(f"Document changed: {params.text_document.uri}")
-    # TODO: Could add debouncing here to avoid too frequent analysis
-    pass
+    doc = server.workspace.get_text_document(params.text_document.uri)
+    # Use debounced analysis to avoid spamming AI
+    asyncio.create_task(server._debounced_analyze(doc.uri, doc.source))
 
 
-# TODO: Handle document changes in a smarter way i.e. pass cache to agent + update incrementally
 @server.feature(TEXT_DOCUMENT_CODE_ACTION)
 async def code_action(params: CodeActionParams) -> list[CodeAction]:
     """Provide code actions for AI LSP diagnostics"""
-    server.logger.info(f"Code action requested for {params.text_document.uri}")
-
     actions = []
     uri = params.text_document.uri
-
-    # Get cached issues for this document
+    doc = server.workspace.get_text_document(uri)
     cached_issues = server._diagnostic_cache.get(uri, [])
 
-    # Find issues that overlap with the requested range
     for issue in cached_issues:
         if not issue.suggested_fixes:
             continue
 
-        issue_range = Range(
-            start=Position(line=issue.line, character=issue.column),
-            end=Position(line=issue.end_line, character=issue.end_column),
-        )
+        for fix in issue.suggested_fixes:
+            target_positions = server._find_snippet_in_text(
+                doc.source, fix.target_snippet
+            )
 
-        # Check if the issue range overlaps with the requested range
-        if _ranges_overlap(issue_range, params.range):
-            for fix in issue.suggested_fixes:
+            if target_positions:
+                start_line, start_col, end_line, end_col = target_positions[0]
                 fix_range = Range(
-                    start=Position(line=fix.line, character=fix.column),
-                    end=Position(line=fix.end_line, character=fix.end_column),
+                    start=Position(line=start_line, character=start_col),
+                    end=Position(line=end_line, character=end_col),
                 )
 
                 edit = WorkspaceEdit(
-                    changes={
-                        uri: [
-                            TextEdit(
-                                range=fix_range,
-                                new_text=fix.code,
-                            )
-                        ]
-                    }
+                    changes={uri: [TextEdit(range=fix_range, new_text=fix.code)]}
                 )
 
                 action = CodeAction(
@@ -287,16 +326,6 @@ async def code_action(params: CodeActionParams) -> list[CodeAction]:
                 actions.append(action)
 
     return actions
-
-
-def _ranges_overlap(range1: Range, range2: Range) -> bool:
-    """Check if two ranges overlap"""
-    start1 = (range1.start.line, range1.start.character)
-    end1 = (range1.end.line, range1.end.character)
-    start2 = (range2.start.line, range2.start.character)
-    end2 = (range2.end.line, range2.end.character)
-
-    return start1 <= end2 and start2 <= end1
 
 
 @app.command()
