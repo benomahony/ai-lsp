@@ -24,6 +24,7 @@ dependencies = [
   "pydantic>=2.0.0",
   "pydantic-ai>=0.4.11",
   "pydantic-settings>=2.10.1",
+  "ruff>=0.12.12",
 ]
 
 [project.urls]
@@ -32,3 +33,33 @@ Repository = "https://github.com/benomahony/ai-lsp"
 
 [project.scripts]
 ai-lsp = "ai_lsp.main:app"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.138.14",
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.1.0",
+  "pytest-cov>=6.2.1",
+  "pytest-mock>=3.15.0",
+]
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+  "--cov=ai_lsp",
+  "--cov-report=term-missing",
+  "--cov-report=html",
+  "--cov-report=json",
+  "--cov-branch",
+  "--cov-fail-under=75",
+]
+testpaths = ["tests"]
+filterwarnings = ["error", "ignore::UserWarning", "ignore::DeprecationWarning"]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "integration: marks tests as integration tests",
+  "unit: marks tests as unit tests",
+]
+asyncio_mode = "auto"
