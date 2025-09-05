@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 
 from pydantic_ai.models import KnownModelName
 import typer
@@ -36,7 +37,7 @@ def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
         log_file = Path("ai-lsp.log")
 
     logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
+        level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.FileHandler(log_file),
@@ -76,13 +77,13 @@ class DiagnosticResult(BaseModel):
 class AILanguageServer(LanguageServer):
     def __init__(self):
         super().__init__("ai-lsp", "v0.1.0")
-        self.logger = logging.getLogger("ai-lsp.server")
+        self.logger: logging.Logger = logging.getLogger("ai-lsp.server")
         self.logger.info("Initializing AI Language Server")
-        self._diagnostic_cache: dict[str, list[CodeIssue]] = {}
-        self._pending_tasks: dict[str, asyncio.Task] = {}
+        self.diagnostic_cache: dict[str, list[CodeIssue]] = {}
+        self._pending_tasks: dict[str, asyncio.Task[Any]] = {}
         self._analysis_locks: dict[str, asyncio.Lock] = {}
 
-        self.agent = Agent(
+        self.agent: Agent[DiagnosticResult, Any] = Agent(
             model=settings.ai_lsp_model,
             output_type=DiagnosticResult,
             system_prompt="""You are an AI code analyzer that provides semantic insights that traditional LSPs cannot detect.
@@ -118,53 +119,55 @@ Focus on insights that require understanding code intent and context. Keep issue
         )
         self.logger.info("AI agent initialized successfully")
 
-    def _find_snippet_in_text(
+    def find_snippet_in_text(
         self, text: str, snippet: str
     ) -> list[tuple[int, int, int, int]]:
-        """Find code snippet in text, return positions as (start_line, start_col, end_line, end_col)"""
+        """Find all occurrences of code snippet in text, return positions as (start_line, start_col, end_line, end_col)"""
         snippet = snippet.strip()
+        positions = []
 
-        # Search entire document for snippet (handles multi-line)
-        start_pos = text.find(snippet)
-        if start_pos == -1:
-            self.logger.warning(f"Could not find snippet '{snippet}' in text")
-            return []
-
-        # Convert character position to line/column
-        lines = text.split("\n")
-        char_count = 0
-        start_line = 0
-        start_col = 0
-
-        for i, line in enumerate(lines):
-            if char_count + len(line) >= start_pos:
-                start_line = i
-                start_col = start_pos - char_count
+        # Search for all occurrences of snippet
+        start_pos = 0
+        while True:
+            start_pos = text.find(snippet, start_pos)
+            if start_pos == -1:
                 break
-            char_count += len(line) + 1  # +1 for newline
 
-        # Calculate end position
-        snippet_lines = snippet.split("\n")
-        if len(snippet_lines) == 1:
-            end_line = start_line
-            end_col = start_col + len(snippet)
+            # Convert character position to line/column
+            lines = text[:start_pos].split("\n")
+            start_line = len(lines) - 1
+            start_col = len(lines[-1])
+
+            # Calculate end position
+            snippet_lines = snippet.split("\n")
+            if len(snippet_lines) == 1:
+                end_line = start_line
+                end_col = start_col + len(snippet)
+            else:
+                end_line = start_line + len(snippet_lines) - 1
+                end_col = len(snippet_lines[-1])
+
+            positions.append((start_line, start_col, end_line, end_col))
+            start_pos += 1  # Move past this occurrence
+
+        if not positions:
+            self.logger.warning(f"Could not find snippet '{snippet}' in text")
         else:
-            end_line = start_line + len(snippet_lines) - 1
-            end_col = len(snippet_lines[-1])
+            self.logger.debug(
+                f"Found {len(positions)} occurrences of '{snippet[:20]}...'"
+            )
 
-        self.logger.debug(
-            f"Found '{snippet[:20]}...' at line {start_line}, cols {start_col}-{end_col}"
-        )
-        return [(start_line, start_col, end_line, end_col)]
+        return positions
 
-    async def _debounced_analyze(self, uri: str, text: str):
+    async def debounced_analyze(self, uri: str, text: str):
         """Debounced analysis that cancels previous calls"""
         # Cancel any existing task for this URI
         if uri in self._pending_tasks:
             self._pending_tasks[uri].cancel()
+            _ = self._pending_tasks.pop(uri, None)
 
         # Create new task
-        task = asyncio.create_task(self._delayed_analyze(uri, text))
+        task: asyncio.Task[None] = asyncio.create_task(self._delayed_analyze(uri, text))
         self._pending_tasks[uri] = task
 
         try:
@@ -174,7 +177,7 @@ Focus on insights that require understanding code intent and context. Keep issue
         finally:
             # Clean up completed task
             if uri in self._pending_tasks and self._pending_tasks[uri] == task:
-                del self._pending_tasks[uri]
+                _ = self._pending_tasks.pop(uri)
 
     async def _delayed_analyze(self, uri: str, text: str):
         """Wait for debounce period then analyze"""
@@ -209,11 +212,11 @@ File: {file_path.name}"""
                 )
 
                 # Cache the issues
-                self._diagnostic_cache[uri] = result.output.issues
+                self.diagnostic_cache[uri] = result.output.issues
 
                 diagnostics = []
                 for issue in result.output.issues:
-                    positions = self._find_snippet_in_text(text, issue.issue_snippet)
+                    positions = self.find_snippet_in_text(text, issue.issue_snippet)
 
                     if positions:
                         start_line, start_col, end_line, end_col = positions[0]
@@ -270,9 +273,7 @@ async def did_open(params: DidOpenTextDocumentParams):
     """Analyze document when opened"""
     server.logger.info(f"Document opened: {params.text_document.uri}")
     doc = params.text_document
-    diagnostics = await server.analyze_document(doc.uri, doc.text)
-    server.publish_diagnostics(doc.uri, diagnostics)
-    server.logger.info(f"Published {len(diagnostics)} diagnostics for {doc.uri}")
+    await server.debounced_analyze(doc.uri, doc.text)
 
 
 @server.feature(TEXT_DOCUMENT_DID_SAVE)
@@ -280,9 +281,7 @@ async def did_save(params: DidSaveTextDocumentParams):
     """Analyze document when saved"""
     server.logger.info(f"Document saved: {params.text_document.uri}")
     doc = server.workspace.get_text_document(params.text_document.uri)
-    diagnostics = await server.analyze_document(doc.uri, doc.source)
-    server.publish_diagnostics(doc.uri, diagnostics)
-    server.logger.info(f"Published {len(diagnostics)} diagnostics for {doc.uri}")
+    await server.debounced_analyze(doc.uri, doc.source)
 
 
 @server.feature(TEXT_DOCUMENT_DID_CHANGE)
@@ -291,23 +290,52 @@ async def did_change(params: DidChangeTextDocumentParams):
     server.logger.debug(f"Document changed: {params.text_document.uri}")
     doc = server.workspace.get_text_document(params.text_document.uri)
     # Use debounced analysis to avoid spamming AI
-    asyncio.create_task(server._debounced_analyze(doc.uri, doc.source))
+    await server.debounced_analyze(doc.uri, doc.source)
 
 
 @server.feature(TEXT_DOCUMENT_CODE_ACTION)
 async def code_action(params: CodeActionParams) -> list[CodeAction]:
     """Provide code actions for AI LSP diagnostics"""
-    actions = []
+    actions: list[CodeAction] = []
     uri = params.text_document.uri
     doc = server.workspace.get_text_document(uri)
-    cached_issues = server._diagnostic_cache.get(uri, [])
+    cached_issues = server.diagnostic_cache.get(uri, [])
+
+    # Get the request range for filtering
+    request_range = params.range
 
     for issue in cached_issues:
         if not issue.suggested_fixes:
             continue
 
+        # Check if issue overlaps with the request range
+        issue_positions = server.find_snippet_in_text(doc.source, issue.issue_snippet)
+        if not issue_positions:
+            continue
+
+        start_line, start_col, end_line, end_col = issue_positions[0]
+        issue_range = Range(
+            start=Position(line=start_line, character=start_col),
+            end=Position(line=end_line, character=end_col),
+        )
+
+        # Skip if issue doesn't overlap with request range
+        if (
+            issue_range.end.line < request_range.start.line
+            or issue_range.start.line > request_range.end.line
+            or (
+                issue_range.end.line == request_range.start.line
+                and issue_range.end.character < request_range.start.character
+            )
+            or (
+                issue_range.start.line == request_range.end.line
+                and issue_range.start.character > request_range.end.character
+            )
+        ):
+            continue
+
         for fix in issue.suggested_fixes:
-            target_positions = server._find_snippet_in_text(
+            target_positions = server.find_snippet_in_text(
                 doc.source, fix.target_snippet
             )
 
