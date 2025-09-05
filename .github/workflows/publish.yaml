@@ -10,12 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/python-tools-mcp
+      url: https://pypi.org/p/ai-lsp
     permissions:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,12 +29,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Install build dependencies
-        run: |
-          uv sync
+        run: uv sync
 
       - name: Build package
-        run: |
-          uv build
+        run: uv build
 
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
