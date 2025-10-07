@@ -3,7 +3,6 @@ Shared test fixtures and utilities for AI LSP tests.
 """
 
 import os
-import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
