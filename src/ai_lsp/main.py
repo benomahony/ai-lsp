@@ -50,7 +50,7 @@ def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
 
 
 class Settings(BaseSettings):
-    ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-pro")
+    ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-flash")
     debounce_ms: int = Field(default=1000)  # 1 second debounce
 
 
