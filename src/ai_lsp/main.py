@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic_ai.models import KnownModelName
 import typer
@@ -65,7 +65,7 @@ class SuggestedFix(BaseModel):
 
 class CodeIssue(BaseModel):
     issue_snippet: str
-    severity: str  # "error", "warning", "info", "hint"
+    severity: Literal["error", "warning", "info", "hint"]
     message: str
     suggested_fixes: list[SuggestedFix] | None = None
 
