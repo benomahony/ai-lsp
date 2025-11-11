@@ -1,8 +1,8 @@
 import asyncio
 import os
 from pathlib import Path
-from typing import Any, Literal
-
+from typing import Literal
+from importlib.metadata import version
 import logfire
 from lsprotocol.types import (
     TEXT_DOCUMENT_CODE_ACTION,
@@ -28,18 +28,26 @@ from pydantic_ai.models import KnownModelName
 from pydantic_settings import BaseSettings
 from pygls.server import LanguageServer
 
-os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://localhost:4318"
-_ = logfire.configure(send_to_logfire=False, service_name="ai-lsp")
-logfire.instrument_pydantic_ai()
-logfire.instrument_httpx(capture_all=True)
-
 
 class Settings(BaseSettings):
     ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-flash")
     debounce_ms: int = Field(default=1000)
+    max_cache_size: int = Field(default=50)
+    configure_logfire: bool = Field(default=True)
+    otel_exporter_otlp_endpoint: str = Field(
+        default="http://localhost:5173/api/v1/private/otel"
+    )
 
 
 settings = Settings()
+
+
+os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = settings.otel_exporter_otlp_endpoint
+
+if settings.configure_logfire:
+    logfire.configure(send_to_logfire=False, service_name="ai-lsp")  # pyright: ignore[reportUnusedCallResult]
+    logfire.instrument_pydantic_ai()
+    logfire.instrument_httpx(capture_all=True)
 
 
 class SuggestedFix(BaseModel):
@@ -61,7 +69,7 @@ class DiagnosticResult(BaseModel):
 
 class AILanguageServer(LanguageServer):
     def __init__(self):
-        super().__init__("ai-lsp", "v0.1.0")
+        super().__init__("ai-lsp", version("ai-lsp"))
         logfire.info("Initializing AI Language Server")
         self.diagnostic_cache: dict[str, list[CodeIssue]] = {}
         self._pending_tasks: dict[str, asyncio.Task[Any]] = {}
