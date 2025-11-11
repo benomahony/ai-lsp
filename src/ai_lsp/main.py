@@ -230,29 +230,44 @@ File: {file_path.name}"""
                     return []
 
     def _get_diagnostic_severity(self, severity: str) -> DiagnosticSeverity:
-        severity_map = {
-            "error": DiagnosticSeverity.Error,
-            "warning": DiagnosticSeverity.Warning,
-            "info": DiagnosticSeverity.Information,
-            "hint": DiagnosticSeverity.Hint,
-        }
-        return severity_map.get(severity, DiagnosticSeverity.Information)
+        match severity:
+            case "error":
+                return DiagnosticSeverity.Error
+            case "warning":
+                return DiagnosticSeverity.Warning
+            case "info":
+                return DiagnosticSeverity.Information
+            case "hint":
+                return DiagnosticSeverity.Hint
+            case _:
+                return DiagnosticSeverity.Information
 
     def _detect_language(self, file_path: Path) -> str:
-        suffix_map = {
-            ".py": "python",
-            ".js": "javascript",
-            ".ts": "typescript",
-            ".jsx": "jsx",
-            ".tsx": "tsx",
-            ".rs": "rust",
-            ".go": "go",
-            ".java": "java",
-            ".cpp": "cpp",
-            ".c": "c",
-            ".lua": "lua",
-        }
-        return suffix_map.get(file_path.suffix, "text")
+        match file_path.suffix:
+            case ".py":
+                return "python"
+            case ".js":
+                return "javascript"
+            case ".ts":
+                return "typescript"
+            case ".jsx":
+                return "jsx"
+            case ".tsx":
+                return "tsx"
+            case ".rs":
+                return "rust"
+            case ".go":
+                return "go"
+            case ".java":
+                return "java"
+            case ".cpp":
+                return "cpp"
+            case ".c":
+                return "c"
+            case ".lua":
+                return "lua"
+            case _:
+                return "text"
 
 
 server = AILanguageServer()
