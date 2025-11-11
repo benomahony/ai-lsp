@@ -1,10 +1,9 @@
 import asyncio
-import logging
+import os
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic_ai.models import KnownModelName
-import typer
+import logfire
 from lsprotocol.types import (
     TEXT_DOCUMENT_CODE_ACTION,
     TEXT_DOCUMENT_DID_CHANGE,
@@ -25,33 +24,19 @@ from lsprotocol.types import (
 )
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from pydantic_ai.models import KnownModelName
 from pydantic_settings import BaseSettings
 from pygls.server import LanguageServer
 
-app = typer.Typer()
-
-
-def setup_logging(log_level: str = "INFO", log_file: Path | None = None):
-    """Setup logging for the LSP server. Must log to file since stdio is used for LSP communication."""
-    if log_file is None:
-        log_file = Path("ai-lsp.log")
-
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-        ],
-    )
-
-    logger = logging.getLogger("ai-lsp")
-    logger.info(f"AI LSP Server starting, logging to {log_file}")
-    return logger
+os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://localhost:4318"
+_ = logfire.configure(send_to_logfire=False, service_name="ai-lsp")
+logfire.instrument_pydantic_ai()
+logfire.instrument_httpx(capture_all=True)
 
 
 class Settings(BaseSettings):
     ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-flash")
-    debounce_ms: int = Field(default=1000)  # 1 second debounce
+    debounce_ms: int = Field(default=1000)
 
 
 settings = Settings()
@@ -77,8 +62,7 @@ class DiagnosticResult(BaseModel):
 class AILanguageServer(LanguageServer):
     def __init__(self):
         super().__init__("ai-lsp", "v0.1.0")
-        self.logger: logging.Logger = logging.getLogger("ai-lsp.server")
-        self.logger.info("Initializing AI Language Server")
+        logfire.info("Initializing AI Language Server")
         self.diagnostic_cache: dict[str, list[CodeIssue]] = {}
         self._pending_tasks: dict[str, asyncio.Task[Any]] = {}
         self._analysis_locks: dict[str, asyncio.Lock] = {}
@@ -117,7 +101,7 @@ For each issue, provide:
 
 Focus on insights that require understanding code intent and context. Keep issue_snippet to the absolute minimum - just the problematic token.""",
         )
-        self.logger.info("AI agent initialized successfully")
+        logfire.info("AI agent initialized successfully")
 
     def find_snippet_in_text(
         self, text: str, snippet: str
@@ -151,11 +135,9 @@ Focus on insights that require understanding code intent and context. Keep issue
             start_pos += 1  # Move past this occurrence
 
         if not positions:
-            self.logger.warning(f"Could not find snippet '{snippet}' in text")
+            logfire.warn(f"Could not find snippet '{snippet}' in text")
         else:
-            self.logger.debug(
-                f"Found {len(positions)} occurrences of '{snippet[:20]}...'"
-            )
+            logfire.debug(f"Found {len(positions)} occurrences of '{snippet[:20]}...'")
 
         return positions
 
@@ -173,7 +155,7 @@ Focus on insights that require understanding code intent and context. Keep issue
         try:
             await task
         except asyncio.CancelledError:
-            self.logger.debug(f"Analysis cancelled for {uri}")
+            logfire.debug(f"Analysis cancelled for {uri}")
         finally:
             # Clean up completed task
             if uri in self._pending_tasks and self._pending_tasks[uri] == task:
@@ -184,21 +166,20 @@ Focus on insights that require understanding code intent and context. Keep issue
         await asyncio.sleep(settings.debounce_ms / 1000.0)
         diagnostics = await self.analyze_document(uri, text)
         self.publish_diagnostics(uri, diagnostics)
-        self.logger.debug(f"Published {len(diagnostics)} diagnostics for {uri}")
+        logfire.debug(f"Published {len(diagnostics)} diagnostics for {uri}")
 
     async def analyze_document(self, uri: str, text: str) -> list[Diagnostic]:
-        """Analyze document with race condition protection"""
         # Ensure we have a lock for this URI
         lock = self._analysis_locks.setdefault(uri, asyncio.Lock())
         async with lock:
-            self.logger.info(f"Starting AI analysis for {uri}")
+            with logfire.span("analyze_document", uri=uri):
+                logfire.info(f"Starting AI analysis for {uri}")
 
-            # Always run fresh AI analysis - removed buggy caching logic
-            try:
-                file_path = Path(uri.replace("file://", ""))
-                language = self._detect_language(file_path)
+                try:
+                    file_path = Path(uri.replace("file://", ""))
+                    language = self._detect_language(file_path)
 
-                prompt = f"""Analyze this {language} code for issues:
+                    prompt = f"""Analyze this {language} code for issues:
 
 ```{language}
 {text}
@@ -206,38 +187,39 @@ Focus on insights that require understanding code intent and context. Keep issue
 
 File: {file_path.name}"""
 
-                result = await self.agent.run(prompt)
-                self.logger.info(
-                    f"AI analysis completed, found {len(result.output.issues)} issues"
-                )
+                    result = await self.agent.run(prompt)
+                    logfire.info(
+                        f"AI analysis completed, found {len(result.output.issues)} issues"
+                    )
 
-                # Cache the issues
-                self.diagnostic_cache[uri] = result.output.issues
+                    self.diagnostic_cache[uri] = result.output.issues
 
-                diagnostics = []
-                for issue in result.output.issues:
-                    positions = self.find_snippet_in_text(text, issue.issue_snippet)
+                    diagnostics = []
+                    for issue in result.output.issues:
+                        positions = self.find_snippet_in_text(text, issue.issue_snippet)
 
-                    if positions:
-                        start_line, start_col, end_line, end_col = positions[0]
-                        diagnostic = Diagnostic(
-                            range=Range(
-                                start=Position(line=start_line, character=start_col),
-                                end=Position(line=end_line, character=end_col),
-                            ),
-                            message=f"AI LSP: {issue.message}",
-                            severity=self._get_diagnostic_severity(issue.severity),
-                            source="ai-lsp",
-                        )
-                        diagnostics.append(diagnostic)
+                        if positions:
+                            start_line, start_col, end_line, end_col = positions[0]
+                            diagnostic = Diagnostic(
+                                range=Range(
+                                    start=Position(
+                                        line=start_line, character=start_col
+                                    ),
+                                    end=Position(line=end_line, character=end_col),
+                                ),
+                                message=f"AI LSP: {issue.message}",
+                                severity=self._get_diagnostic_severity(issue.severity),
+                                source="ai-lsp",
+                            )
+                            diagnostics.append(diagnostic)
 
-                return diagnostics
+                    return diagnostics
 
-            except Exception as e:
-                self.logger.error(
-                    f"AI analysis failed for {uri}: {str(e)}", exc_info=True
-                )
-                return []
+                except Exception as e:
+                    logfire.error(
+                        f"AI analysis failed for {uri}: {str(e)}", _exc_info=True
+                    )
+                    return []
 
     def _get_diagnostic_severity(self, severity: str) -> DiagnosticSeverity:
         severity_map = {
@@ -270,121 +252,102 @@ server = AILanguageServer()
 
 @server.feature(TEXT_DOCUMENT_DID_OPEN)
 async def did_open(params: DidOpenTextDocumentParams):
-    """Analyze document when opened"""
-    server.logger.info(f"Document opened: {params.text_document.uri}")
+    logfire.info(f"Document opened: {params.text_document.uri}")
     doc = params.text_document
     await server.debounced_analyze(doc.uri, doc.text)
 
 
 @server.feature(TEXT_DOCUMENT_DID_SAVE)
 async def did_save(params: DidSaveTextDocumentParams):
-    """Analyze document when saved"""
-    server.logger.info(f"Document saved: {params.text_document.uri}")
+    logfire.info(f"Document saved: {params.text_document.uri}")
     doc = server.workspace.get_text_document(params.text_document.uri)
     await server.debounced_analyze(doc.uri, doc.source)
 
 
 @server.feature(TEXT_DOCUMENT_DID_CHANGE)
 async def did_change(params: DidChangeTextDocumentParams):
-    """Debounced analysis on change"""
-    server.logger.debug(f"Document changed: {params.text_document.uri}")
+    logfire.debug(f"Document changed: {params.text_document.uri}")
     doc = server.workspace.get_text_document(params.text_document.uri)
-    # Use debounced analysis to avoid spamming AI
     await server.debounced_analyze(doc.uri, doc.source)
 
 
 @server.feature(TEXT_DOCUMENT_CODE_ACTION)
 async def code_action(params: CodeActionParams) -> list[CodeAction]:
-    """Provide code actions for AI LSP diagnostics"""
-    actions: list[CodeAction] = []
-    uri = params.text_document.uri
-    doc = server.workspace.get_text_document(uri)
-    cached_issues = server.diagnostic_cache.get(uri, [])
+    with logfire.span("code_action", uri=params.text_document.uri):
+        actions: list[CodeAction] = []
+        uri = params.text_document.uri
+        doc = server.workspace.get_text_document(uri)
+        cached_issues = server.diagnostic_cache.get(uri, [])
 
-    # Get the request range for filtering
-    request_range = params.range
+        request_range = params.range
 
-    for issue in cached_issues:
-        if not issue.suggested_fixes:
-            continue
+        for issue in cached_issues:
+            if not issue.suggested_fixes:
+                continue
 
-        # Check if issue overlaps with the request range
-        issue_positions = server.find_snippet_in_text(doc.source, issue.issue_snippet)
-        if not issue_positions:
-            continue
-
-        start_line, start_col, end_line, end_col = issue_positions[0]
-        issue_range = Range(
-            start=Position(line=start_line, character=start_col),
-            end=Position(line=end_line, character=end_col),
-        )
-
-        # Skip if issue doesn't overlap with request range
-        if (
-            issue_range.end.line < request_range.start.line
-            or issue_range.start.line > request_range.end.line
-            or (
-                issue_range.end.line == request_range.start.line
-                and issue_range.end.character < request_range.start.character
+            issue_positions = server.find_snippet_in_text(
+                doc.source, issue.issue_snippet
             )
-            or (
-                issue_range.start.line == request_range.end.line
-                and issue_range.start.character > request_range.end.character
-            )
-        ):
-            continue
+            if not issue_positions:
+                continue
 
-        for fix in issue.suggested_fixes:
-            target_positions = server.find_snippet_in_text(
-                doc.source, fix.target_snippet
+            start_line, start_col, end_line, end_col = issue_positions[0]
+            issue_range = Range(
+                start=Position(line=start_line, character=start_col),
+                end=Position(line=end_line, character=end_col),
             )
 
-            if target_positions:
-                start_line, start_col, end_line, end_col = target_positions[0]
-                fix_range = Range(
-                    start=Position(line=start_line, character=start_col),
-                    end=Position(line=end_line, character=end_col),
+            if (
+                issue_range.end.line < request_range.start.line
+                or issue_range.start.line > request_range.end.line
+                or (
+                    issue_range.end.line == request_range.start.line
+                    and issue_range.end.character < request_range.start.character
+                )
+                or (
+                    issue_range.start.line == request_range.end.line
+                    and issue_range.start.character > request_range.end.character
+                )
+            ):
+                continue
+
+            for fix in issue.suggested_fixes:
+                target_positions = server.find_snippet_in_text(
+                    doc.source, fix.target_snippet
                 )
 
-                edit = WorkspaceEdit(
-                    changes={
-                        uri: [
-                            TextEdit(range=fix_range, new_text=fix.replacement_snippet)
-                        ]
-                    }
-                )
+                if target_positions:
+                    with logfire.span("creating_quick_fix", title=fix.title):
+                        start_line, start_col, end_line, end_col = target_positions[0]
+                        fix_range = Range(
+                            start=Position(line=start_line, character=start_col),
+                            end=Position(line=end_line, character=end_col),
+                        )
 
-                action = CodeAction(
-                    title=fix.title,
-                    kind=CodeActionKind.QuickFix,
-                    edit=edit,
-                    is_preferred=True,
-                )
-                actions.append(action)
+                        edit = WorkspaceEdit(
+                            changes={
+                                uri: [
+                                    TextEdit(
+                                        range=fix_range,
+                                        new_text=fix.replacement_snippet,
+                                    )
+                                ]
+                            }
+                        )
 
-    return actions
+                        action = CodeAction(
+                            title=fix.title,
+                            kind=CodeActionKind.QuickFix,
+                            edit=edit,
+                            is_preferred=True,
+                        )
+                        actions.append(action)
+
+        return actions
 
 
-@app.command()
-def serve(
-    host: str = "127.0.0.1",
-    port: int = 8765,
-    tcp: bool = False,
-    log_level: str = "INFO",
-    log_file: str | None = None,
-):
-    """Start the AI LSP server"""
-    log_path = Path(log_file) if log_file else None
-    logger = setup_logging(log_level, log_path)
-
-    logger.info(f"Starting AI LSP server (tcp={tcp}, host={host}, port={port})")
-
-    if tcp:
-        logger.info(f"Starting TCP server on {host}:{port}")
-        server.start_tcp(host, port)
-    else:
-        logger.info("Starting stdio server")
-        server.start_io()
+def app():
+    server.start_io()
 
 
 if __name__ == "__main__":

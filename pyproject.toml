@@ -27,6 +27,7 @@ dependencies = [
   "pydantic-ai>=0.4.11",
   "pydantic-settings>=2.10.1",
   "ruff>=0.12.12",
+  "logfire[httpx]>=4.14.2",
 ]
 
 [project.urls]
