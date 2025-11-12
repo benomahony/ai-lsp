@@ -1,8 +1,10 @@
+from ai_lsp.agent import create_diagnostic_agent
 import asyncio
 import os
-from pathlib import Path
-from typing import Any, Literal
 from importlib.metadata import version
+from pathlib import Path
+from typing import Any
+
 import logfire
 
 # pyrefly: ignore [missing-import]
@@ -26,22 +28,12 @@ from lsprotocol.types import (
     TextEdit,
     WorkspaceEdit,
 )
-from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.models import KnownModelName
-from pydantic_settings import BaseSettings
 
 # pyrefly: ignore [missing-import]
 from pygls.server import LanguageServer
 
-
-class Settings(BaseSettings):
-    ai_lsp_model: KnownModelName = Field(default="google-gla:gemini-2.5-flash")
-    debounce_ms: int = Field(default=1000)
-    max_cache_size: int = Field(default=50)
-    configure_logfire: bool = Field(default=True)
-    otel_exporter_otlp_endpoint: str = Field(default="http://localhost:4318")
-
+from ai_lsp.models import DiagnosticResult, Settings
 
 settings = Settings()
 
@@ -54,63 +46,14 @@ if settings.configure_logfire:
     logfire.instrument_httpx(capture_all=True)
 
 
-class SuggestedFix(BaseModel):
-    title: str
-    target_snippet: str
-    replacement_snippet: str
-
-
-class CodeIssue(BaseModel):
-    issue_snippet: str
-    severity: Literal["error", "warning", "info", "hint"]
-    message: str
-    suggested_fixes: list[SuggestedFix] | None = None
-
-
-class DiagnosticResult(BaseModel):
-    issues: list[CodeIssue]
-
-
 class AILanguageServer(LanguageServer):
     def __init__(self):
         super().__init__("ai-lsp", version("ai-lsp"))
         logfire.info("Initializing AI Language Server")
         self._pending_tasks: dict[str, asyncio.Task[Any]] = {}
         self._analysis_locks: dict[str, asyncio.Lock] = {}
-
-        self.agent: Agent[DiagnosticResult, Any] = Agent(
-            model=settings.ai_lsp_model,
-            output_type=DiagnosticResult,
-            system_prompt="""You are an AI code analyzer that provides semantic insights that traditional LSPs cannot detect.
-
-ONLY flag issues that require deep semantic understanding:
-- Logic errors in algorithms or business logic
-- Subtle race conditions or concurrency issues  
-- Architectural problems and design pattern violations
-- Security vulnerabilities requiring context understanding
-- Performance anti-patterns that need semantic analysis
-- Complex data flow issues
-- Domain-specific best practice violations
-- Accessibility issues requiring UX understanding
-
-DO NOT flag issues that normal LSPs handle:
-- Syntax errors
-- Basic type errors  
-- Undefined variables
-- Import issues
-- Basic formatting problems
-- Simple linting rules
-
-For each issue, provide:
-- The exact issue_snippet that has the problem (ONLY the problematic token/value, e.g. just "python" not 'command = "python"')
-- Clear explanation of WHY this needs human attention in the message
-- Use severity: "info" for suggestions, "warning" for concerns, "error" for serious logic issues
-- When possible, provide suggested_fixes with:
-  - target_snippet: the exact code to replace (same as issue_snippet usually)
-  - replacement_snippet: the replacement code
-  - title: clear description of the fix
-
-Focus on insights that require understanding code intent and context. Keep issue_snippet to the absolute minimum - just the problematic token.""",
+        self.agent: Agent[DiagnosticResult, Any] = create_diagnostic_agent(
+            model=settings.ai_lsp_model
         )
         logfire.info("AI agent initialized successfully")
 
