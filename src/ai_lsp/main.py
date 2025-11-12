@@ -1,9 +1,11 @@
 import asyncio
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from importlib.metadata import version
 import logfire
+
+# pyrefly: ignore [missing-import]
 from lsprotocol.types import (
     TEXT_DOCUMENT_CODE_ACTION,
     TEXT_DOCUMENT_DID_CHANGE,
@@ -11,7 +13,9 @@ from lsprotocol.types import (
     TEXT_DOCUMENT_DID_SAVE,
     CodeAction,
     CodeActionKind,
+    CodeActionOptions,
     CodeActionParams,
+    Command,
     Diagnostic,
     DiagnosticSeverity,
     DidChangeTextDocumentParams,
@@ -26,6 +30,8 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models import KnownModelName
 from pydantic_settings import BaseSettings
+
+# pyrefly: ignore [missing-import]
 from pygls.server import LanguageServer
 
 
@@ -34,9 +40,7 @@ class Settings(BaseSettings):
     debounce_ms: int = Field(default=1000)
     max_cache_size: int = Field(default=50)
     configure_logfire: bool = Field(default=True)
-    otel_exporter_otlp_endpoint: str = Field(
-        default="http://localhost:5173/api/v1/private/otel"
-    )
+    otel_exporter_otlp_endpoint: str = Field(default="http://localhost:4318")
 
 
 settings = Settings()
@@ -71,7 +75,6 @@ class AILanguageServer(LanguageServer):
     def __init__(self):
         super().__init__("ai-lsp", version("ai-lsp"))
         logfire.info("Initializing AI Language Server")
-        self.diagnostic_cache: dict[str, list[CodeIssue]] = {}
         self._pending_tasks: dict[str, asyncio.Task[Any]] = {}
         self._analysis_locks: dict[str, asyncio.Lock] = {}
 
@@ -173,6 +176,7 @@ Focus on insights that require understanding code intent and context. Keep issue
         """Wait for debounce period then analyze"""
         await asyncio.sleep(settings.debounce_ms / 1000.0)
         diagnostics = await self.analyze_document(uri, text)
+        # pyrefly: ignore [missing-attribute]
         self.publish_diagnostics(uri, diagnostics)
         logfire.debug(f"Published {len(diagnostics)} diagnostics for {uri}")
 
@@ -200,8 +204,6 @@ File: {file_path.name}"""
                         f"AI analysis completed, found {len(result.output.issues)} issues"
                     )
 
-                    self.diagnostic_cache[uri] = result.output.issues
-
                     diagnostics = []
                     for issue in result.output.issues:
                         positions = self.find_snippet_in_text(text, issue.issue_snippet)
@@ -218,6 +220,17 @@ File: {file_path.name}"""
                                 message=f"AI LSP: {issue.message}",
                                 severity=self._get_diagnostic_severity(issue.severity),
                                 source="ai-lsp",
+                                data={
+                                    "issue_snippet": issue.issue_snippet,
+                                    "suggested_fixes": [
+                                        {
+                                            "title": fix.title,
+                                            "target_snippet": fix.target_snippet,
+                                            "replacement_snippet": fix.replacement_snippet,
+                                        }
+                                        for fix in (issue.suggested_fixes or [])
+                                    ],
+                                },
                             )
                             diagnostics.append(diagnostic)
 
@@ -294,53 +307,29 @@ async def did_change(params: DidChangeTextDocumentParams):
     await server.debounced_analyze(doc.uri, doc.source)
 
 
-@server.feature(TEXT_DOCUMENT_CODE_ACTION)
-async def code_action(params: CodeActionParams) -> list[CodeAction]:
-    with logfire.span("code_action", uri=params.text_document.uri):
+@server.feature(
+    TEXT_DOCUMENT_CODE_ACTION,
+    CodeActionOptions(code_action_kinds=[CodeActionKind.QuickFix]),
+)
+async def code_actions(params: CodeActionParams) -> list[CodeAction]:
+    with logfire.span("code_actions", uri=params.text_document.uri):
         actions: list[CodeAction] = []
         uri = params.text_document.uri
         doc = server.workspace.get_text_document(uri)
-        cached_issues = server.diagnostic_cache.get(uri, [])
 
-        request_range = params.range
-
-        for issue in cached_issues:
-            if not issue.suggested_fixes:
+        for diagnostic in params.context.diagnostics:
+            if diagnostic.source != "ai-lsp" or not diagnostic.data:
                 continue
 
-            issue_positions = server.find_snippet_in_text(
-                doc.source, issue.issue_snippet
-            )
-            if not issue_positions:
-                continue
+            suggested_fixes = diagnostic.data.get("suggested_fixes", [])
 
-            start_line, start_col, end_line, end_col = issue_positions[0]
-            issue_range = Range(
-                start=Position(line=start_line, character=start_col),
-                end=Position(line=end_line, character=end_col),
-            )
-
-            if (
-                issue_range.end.line < request_range.start.line
-                or issue_range.start.line > request_range.end.line
-                or (
-                    issue_range.end.line == request_range.start.line
-                    and issue_range.end.character < request_range.start.character
-                )
-                or (
-                    issue_range.start.line == request_range.end.line
-                    and issue_range.start.character > request_range.end.character
-                )
-            ):
-                continue
-
-            for fix in issue.suggested_fixes:
+            for fix_data in suggested_fixes:
                 target_positions = server.find_snippet_in_text(
-                    doc.source, fix.target_snippet
+                    doc.source, fix_data["target_snippet"]
                 )
 
                 if target_positions:
-                    with logfire.span("creating_quick_fix", title=fix.title):
+                    with logfire.span("creating_quick_fix", title=fix_data["title"]):
                         start_line, start_col, end_line, end_col = target_positions[0]
                         fix_range = Range(
                             start=Position(line=start_line, character=start_col),
@@ -352,21 +341,170 @@ async def code_action(params: CodeActionParams) -> list[CodeAction]:
                                 uri: [
                                     TextEdit(
                                         range=fix_range,
-                                        new_text=fix.replacement_snippet,
+                                        new_text=fix_data["replacement_snippet"],
                                     )
                                 ]
                             }
                         )
 
                         action = CodeAction(
-                            title=fix.title,
+                            title=f"Apply: {fix_data['title']}",
                             kind=CodeActionKind.QuickFix,
                             edit=edit,
+                            diagnostics=[diagnostic],
                             is_preferred=True,
                         )
                         actions.append(action)
 
+            actions.append(
+                CodeAction(
+                    title="Regenerate AI fix",
+                    kind=CodeActionKind.QuickFix,
+                    command=Command(
+                        title="Regenerate fix",
+                        command="ai-lsp.regenerateFix",
+                        arguments=[
+                            uri,
+                            diagnostic.data.get("issue_snippet"),
+                            diagnostic.range.start.line,
+                            diagnostic.range.start.character,
+                        ],
+                    ),
+                    diagnostics=[diagnostic],
+                )
+            )
+
+            actions.append(
+                CodeAction(
+                    title="Dismiss AI suggestion",
+                    kind=CodeActionKind.QuickFix,
+                    command=Command(
+                        title="Dismiss",
+                        command="ai-lsp.dismiss",
+                        arguments=[
+                            uri,
+                            diagnostic.range.start.line,
+                            diagnostic.range.start.character,
+                        ],
+                    ),
+                    diagnostics=[diagnostic],
+                )
+            )
+
         return actions
+
+
+@server.command("ai-lsp.regenerateFix")
+async def regenerate_fix(*args):
+    if len(args) < 4:
+        return
+
+    uri, issue_snippet, line, character = args[0], args[1], args[2], args[3]
+
+    with logfire.span("regenerate_fix", uri=uri, issue_snippet=issue_snippet):
+        logfire.info(
+            f"Regenerating fix for '{issue_snippet}' at {uri}:{line}:{character}"
+        )
+
+        doc = server.workspace.get_text_document(uri)
+        file_path = Path(uri.replace("file://", ""))
+        language = server._detect_language(file_path)
+
+        prompt = f"""Analyze this specific code issue and provide NEW suggested fixes.
+
+Issue snippet: {issue_snippet}
+
+Full code context:
+```{language}
+{doc.source}
+```
+
+File: {file_path.name}
+
+Focus ONLY on the issue at the snippet shown. Provide fresh, alternative fixes if possible."""
+
+        try:
+            result = await server.agent.run(prompt)
+
+            if not result.output.issues:
+                logfire.warn("No issues returned for regeneration")
+                return
+
+            regenerated_issue = result.output.issues[0]
+
+            current_diags = getattr(server.lsp, "diagnostics", {}).get(uri, [])
+            updated_diags = []
+
+            for diag in current_diags:
+                if (
+                    diag.source == "ai-lsp"
+                    and diag.range.start.line == line
+                    and diag.range.start.character == character
+                ):
+                    positions = server.find_snippet_in_text(
+                        doc.source, regenerated_issue.issue_snippet
+                    )
+                    if positions:
+                        start_line, start_col, end_line, end_col = positions[0]
+                        updated_diag = Diagnostic(
+                            range=Range(
+                                start=Position(line=start_line, character=start_col),
+                                end=Position(line=end_line, character=end_col),
+                            ),
+                            message=f"AI LSP: {regenerated_issue.message}",
+                            severity=server._get_diagnostic_severity(
+                                regenerated_issue.severity
+                            ),
+                            source="ai-lsp",
+                            data={
+                                "issue_snippet": regenerated_issue.issue_snippet,
+                                "suggested_fixes": [
+                                    {
+                                        "title": fix.title,
+                                        "target_snippet": fix.target_snippet,
+                                        "replacement_snippet": fix.replacement_snippet,
+                                    }
+                                    for fix in (regenerated_issue.suggested_fixes or [])
+                                ],
+                            },
+                        )
+                        updated_diags.append(updated_diag)
+                        logfire.info(
+                            f"Regenerated diagnostic with {len(regenerated_issue.suggested_fixes or [])} new fixes"
+                        )
+                else:
+                    updated_diags.append(diag)
+
+            server.publish_diagnostics(uri, updated_diags)
+
+        except Exception as e:
+            logfire.error(f"Failed to regenerate fix: {str(e)}", _exc_info=True)
+
+
+@server.command("ai-lsp.dismiss")
+def dismiss_suggestion(*args):
+    if len(args) < 3:
+        return
+
+    uri, line, character = args[0], args[1], args[2]
+
+    with logfire.span("dismiss_suggestion", uri=uri, line=line, character=character):
+        logfire.info(f"Dismissing suggestion at {uri}:{line}:{character}")
+
+        doc = server.workspace.get_text_document(uri)
+        diagnostics = []
+
+        current_diags = getattr(server.lsp, "diagnostics", {}).get(uri, [])
+        for diag in current_diags:
+            if (
+                diag.source == "ai-lsp"
+                and diag.range.start.line == line
+                and diag.range.start.character == character
+            ):
+                continue
+            diagnostics.append(diag)
+
+        server.publish_diagnostics(uri, diagnostics)
 
 
 def app():

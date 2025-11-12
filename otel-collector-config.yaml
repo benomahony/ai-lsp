@@ -1,0 +1,34 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  otlphttp/opik:
+    endpoint: http://host.docker.internal:5173/api/v1/private/otel
+    compression: gzip
+
+  file:
+    path: /Users/benomahony/Code/open_source/ai-lsp/ai-lsp-otel.jsonl
+    rotation:
+      max_megabytes: 1000
+      max_days: 100
+      max_backups: 3
+
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlphttp/opik, file]

@@ -181,6 +181,24 @@ Enable verbose logging:
 ai-lsp --log-level DEBUG --log-file debug.log
 ```
 
+## Observability
+
+AI LSP uses OpenTelemetry for full observability. By default, telemetry is sent to a local OTEL Collector which provides dual collection to both Opik and a file backup.
+
+### Quick Start
+
+Run the OTEL Collector:
+
+```bash
+docker compose up -d
+```
+
+This starts the collector which receives traces from ai-lsp and sends them to:
+- **Opik** (http://localhost:5173) - primary backend
+- **File backup** (`/tmp/ai-lsp-otel-backup.jsonl`) - safety net
+
+See [OTEL-SETUP.md](OTEL-SETUP.md) for detailed configuration and recovery procedures.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
