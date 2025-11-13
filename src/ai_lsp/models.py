@@ -28,3 +28,6 @@ class CodeIssue(BaseModel):
 
 class DiagnosticResult(BaseModel):
     issues: list[CodeIssue]
+
+
+print("hi")

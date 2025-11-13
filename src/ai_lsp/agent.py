@@ -37,7 +37,7 @@ For each issue, provide:
   - replacement_snippet: the replacement code
   - title: clear description of the fix
 
-Focus on insights that require understanding code intent and context. Keep issue_snippet to the absolute minimum - just the problematic token.
+Focus on insights that require understanding code intent and context. Keep issue_snippet to the absolute minimum - the most concise problematic expression or statement.
 """
 
 

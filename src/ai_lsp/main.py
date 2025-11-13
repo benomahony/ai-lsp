@@ -448,11 +448,3 @@ def dismiss_suggestion(*args):
             diagnostics.append(diag)
 
         server.publish_diagnostics(uri, diagnostics)
-
-
-def app():
-    server.start_io()
-
-
-if __name__ == "__main__":
-    app()

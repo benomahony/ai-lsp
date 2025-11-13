@@ -34,6 +34,9 @@ dependencies = [
   "pydantic-settings>=2.10.1",
   "ruff>=0.12.12",
   "logfire[httpx]>=4.14.2",
+  "datasets>=3.3.0",
+  "mlx-lm>=0.21.1",
+  "rich>=13.0.0",
 ]
 
 [project.urls]
@@ -41,7 +44,7 @@ Homepage = "https://github.com/benomahony/ai-lsp"
 Repository = "https://github.com/benomahony/ai-lsp"
 
 [project.scripts]
-ai-lsp = "ai_lsp.main:app"
+ai-lsp = "ai_lsp.cli:app"
 
 [dependency-groups]
 dev = [

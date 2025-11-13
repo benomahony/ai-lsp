@@ -24,6 +24,7 @@ AI LSP focuses exclusively on **semantic issues that require deep understanding*
 - **🔧 Code Actions**: Provides automated fixes for detected issues
 - **🎯 Multi-Language**: Supports Python, JavaScript, TypeScript, Rust, Go, Java, C/C++, and Lua
 - **⚖️ Async Architecture**: Non-blocking analysis with race condition protection
+- **🎓 Fine-Tuning**: Train custom models on your codebase patterns (see [Fine-Tuning Guide](src/ai_lsp/finetune/README.md))
 
 ## Installation
 
@@ -198,6 +199,21 @@ This starts the collector which receives traces from ai-lsp and sends them to:
 - **File backup** (`/tmp/ai-lsp-otel-backup.jsonl`) - safety net
 
 See [OTEL-SETUP.md](OTEL-SETUP.md) for detailed configuration and recovery procedures.
+
+## Fine-Tuning
+
+Train a custom model on your OpenTelemetry traces to better understand your codebase (requires Apple Silicon):
+
+```bash
+# Quick start - run complete pipeline
+uv run ai-lsp finetune pipeline ai-lsp-otel.jsonl
+
+# Or step by step
+uv run ai-lsp finetune prepare-dataset ai-lsp-otel.jsonl
+uv run ai-lsp finetune train dataset.json --model-name mlx-community/gemma-2-2b-it-4bit
+```
+
+See the [Fine-Tuning Guide](src/ai_lsp/finetune/README.md) for detailed instructions, model selection, and best practices.
 
 ## License
 
